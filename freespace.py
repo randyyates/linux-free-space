@@ -54,7 +54,7 @@ def node_path(node):
 
 def scan(path, cancel=None, progress=None):
     """Walk `path` without following symlinks or crossing filesystems.
-    Returns (root Dir, error count), or (None, errors) if cancelled."""
+    Returns (root Dir, number of unreadable folders), or (None, n) if cancelled."""
     path = os.path.abspath(path)
     st = os.lstat(path)
     root = Dir(path, None, st.st_blocks * 512, st.st_mtime)
@@ -80,8 +80,7 @@ def scan(path, cancel=None, progress=None):
             for e in it:
                 try:
                     st = e.stat(follow_symlinks=False)
-                except OSError:
-                    errors += 1
+                except OSError:  # vanished mid-scan
                     continue
                 node.count += 1
                 if stat.S_ISDIR(st.st_mode):
@@ -126,6 +125,7 @@ def propagate(node, dsize, dcount):
 def detach_dir(node):
     node.parent.dirs.remove(node)
     propagate(node.parent, -node.size, -(node.count + 1))
+    node.parent = None  # marks it detached (see tree_root)
 
 
 def detach_file(parent, file):
@@ -138,7 +138,39 @@ def replace_dir(old, new):
     parent = old.parent
     parent.dirs[parent.dirs.index(old)] = new
     new.name, new.parent = old.name, parent
+    old.parent = None
     propagate(parent, new.size - old.size, new.count - old.count)
+
+
+def tree_root(node):
+    while node.parent is not None:
+        node = node.parent
+    return node
+
+
+def find(root, path):
+    """The scanned Dir at absolute `path` within `root`'s tree, or None."""
+    top = root.name
+    if path == top:
+        return root
+    prefix = top.rstrip("/") + "/"
+    if not path.startswith(prefix):
+        return None
+    node = root
+    for part in path[len(prefix):].split("/"):
+        node = next((d for d in node.dirs if d.name == part), None)
+        if node is None or node.flags & MOUNTPOINT:
+            return None
+    return node
+
+
+def count_unreadable(node):
+    n, stack = 0, [node]
+    while stack:
+        d = stack.pop()
+        n += bool(d.flags & UNREADABLE)
+        stack.extend(d.dirs)
+    return n
 
 
 def iter_files(node):
@@ -221,15 +253,19 @@ class Window(Gtk.ApplicationWindow):
         self.history = []
         self.cancel = threading.Event()
         self.scan_token = None
-        self.busy = False
+        self.scanning = self.removing = False
+        self.nav_serial = 0
+        self.cache = {}  # top path -> (root Dir, unreadable count); trees never overlap
+        self.location = None  # sidebar location being browsed
+        self.resume = {}  # location -> last folder viewed there
 
         header = Gtk.HeaderBar()
         self.set_titlebar(header)
         open_btn = Gtk.Button(icon_name="folder-open-symbolic", tooltip_text="Scan a folder…")
         open_btn.connect("clicked", self.on_choose_folder)
         header.pack_start(open_btn)
-        self.rescan_btn = Gtk.Button(icon_name="view-refresh-symbolic", tooltip_text="Rescan")
-        self.rescan_btn.connect("clicked", lambda *_: self.root and self.start_scan(node_path(self.root)))
+        self.rescan_btn = Gtk.Button(icon_name="view-refresh-symbolic", tooltip_text="Rescan this folder")
+        self.rescan_btn.connect("clicked", lambda *_: self.rescan_current())
         header.pack_start(self.rescan_btn)
 
         paned = Gtk.Paned(position=250, shrink_start_child=False)
@@ -295,15 +331,21 @@ class Window(Gtk.ApplicationWindow):
         self.build_actions()
         self.update_selection()
         self.update_nav()
-        self.start_scan(start_path)
+        self.open_location(start_path)
 
     # ---- construction ----
 
     def build_sidebar(self):
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-        lb = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+        lb = self.sidebar = Gtk.ListBox(selection_mode=Gtk.SelectionMode.SINGLE)
         lb.add_css_class("navigation-sidebar")
-        lb.connect("row-activated", lambda _lb, row: self.start_scan(row.path))
+        lb.connect("row-activated", lambda _lb, row: self.open_location(row.path))
+        self.side_rows = []
+        self.side_menu = Gtk.PopoverMenu(has_arrow=False, halign=Gtk.Align.START)
+        self.side_menu.set_parent(lb)
+        g = Gtk.GestureClick(button=Gdk.BUTTON_SECONDARY)
+        g.connect("pressed", self.on_sidebar_right_click)
+        lb.add_controller(g)
 
         def add(path, title, icon, show_usage):
             row = Gtk.ListBoxRow()
@@ -313,6 +355,7 @@ class Window(Gtk.ApplicationWindow):
             h.append(Gtk.Image(icon_name=icon))
             h.append(Gtk.Label(label=title, xalign=0, hexpand=True, ellipsize=Pango.EllipsizeMode.MIDDLE))
             v.append(h)
+            row.level = row.free = None
             if show_usage:
                 try:
                     du = shutil.disk_usage(path)
@@ -323,13 +366,19 @@ class Window(Gtk.ApplicationWindow):
                     level.add_offset_value("warn", 0.9)
                     level.add_offset_value("crit", 1.0)
                     v.append(level)
-                    sub = Gtk.Label(label=f"{fmt_size(du.free)} free of {fmt_size(du.total)}", xalign=0)
+                    sub = Gtk.Label(xalign=0)
                     sub.add_css_class("dim-label")
                     sub.add_css_class("caption")
                     v.append(sub)
+                    row.level, row.free = level, sub
                 except OSError:
                     pass
+            row.state = Gtk.Label(xalign=0)
+            row.state.add_css_class("dim-label")
+            row.state.add_css_class("caption")
+            v.append(row.state)
             row.set_child(v)
+            self.side_rows.append(row)
             row.set_tooltip_text(path)
             lb.append(row)
 
@@ -347,6 +396,7 @@ class Window(Gtk.ApplicationWindow):
         sw = Gtk.ScrolledWindow(vexpand=True, hscrollbar_policy=Gtk.PolicyType.NEVER)
         sw.set_child(lb)
         box.append(sw)
+        self.update_sidebar()
         return box
 
     def build_columns(self):
@@ -431,7 +481,7 @@ class Window(Gtk.ApplicationWindow):
         self.menu.set_has_arrow(False)
         self.menu.set_halign(Gtk.Align.START)
         self.menu.set_parent(self.view)
-        self.connect("close-request", lambda *_: self.menu.unparent() or False)
+        self.connect("close-request", lambda *_: self.menu.unparent() or self.side_menu.unparent() or False)
 
     def cell(self, child):
         """Wrap a cell's content so a right-click selects the row and opens the menu."""
@@ -455,17 +505,113 @@ class Window(Gtk.ApplicationWindow):
             a.connect("activate", cb)
             self.add_action(a)
             self.actions[name] = a
+        for name, rescan in (("open-location", False), ("rescan-location", True)):
+            a = Gio.SimpleAction(name=name, parameter_type=GLib.VariantType("s"))
+            a.connect("activate", lambda _a, v, rescan=rescan: self.open_location(v.get_string(), rescan))
+            self.add_action(a)
         keys = Gtk.EventControllerKey()
         keys.connect("key-pressed", self.on_key)
         self.add_controller(keys)
 
+    # ---- scanned trees ----
+
+    @property
+    def busy(self):
+        return self.scanning or self.removing
+
+    def lookup(self, path):
+        """The scanned folder at `path` in any cached tree, or None if not scanned yet."""
+        path = os.path.abspath(path)
+        for root, _ in self.cache.values():
+            node = find(root, path)
+            if node is not None:
+                return node
+        return None
+
+    def attached(self, node):
+        root = tree_root(node)
+        entry = self.cache.get(root.name)
+        return entry is not None and entry[0] is root
+
+    def graft(self, new, errors):
+        """Merge a fresh scan into the cache, replacing whatever it covers."""
+        path = new.name
+        old = self.lookup(path)
+        if old is not None and old.parent is not None:  # a subfolder of a scanned tree
+            top = tree_root(old).name
+            root, n = self.cache[top]
+            self.cache[top] = (root, n - count_unreadable(old) + errors)
+            replace_dir(old, new)
+            return
+        for top in [t for t in self.cache if find(new, t) is not None]:
+            del self.cache[top]  # the same folder, or a tree now inside this one
+        self.cache[path] = (new, errors)
+
+    def open_location(self, path, rescan=False):
+        """Show a location, scanning it only if it has not been scanned yet."""
+        path = os.path.abspath(path)
+        node = None if rescan else self.lookup(path)
+        if node is None:
+            self.start_scan(path, location=path)
+            return
+        last = self.resume.get(path)
+        if last is not None and self.attached(last):
+            node = last
+        self.show(node, path)
+
+    def rescan_current(self):
+        if self.current is not None:
+            self.start_scan(node_path(self.current), location=self.location)
+
+    def show(self, node, location):
+        if self.current is not None and self.location is not None:
+            self.resume[self.location] = self.current
+        self.nav_serial += 1
+        self.location = location
+        root = tree_root(node)
+        if root is not self.root:
+            self.root, self.history, self.current = root, [], None
+        for row in self.side_rows:
+            if row.path == location:
+                self.sidebar.select_row(row)
+                break
+        else:
+            self.sidebar.unselect_all()
+        self.navigate(node)
+
+    def update_sidebar(self):
+        for row in self.side_rows:
+            node = self.lookup(row.path)
+            row.state.set_text(f"Scanned · {fmt_size(node.size)}" if node is not None else "Not scanned yet")
+            if row.level is not None:
+                try:
+                    du = shutil.disk_usage(row.path)
+                    row.level.set_value(du.used / du.total if du.total else 0)
+                    row.free.set_text(f"{fmt_size(du.free)} free of {fmt_size(du.total)}")
+                except OSError:
+                    pass
+
+    def on_sidebar_right_click(self, _gesture, _n, x, y):
+        row = self.sidebar.get_row_at_y(int(y))
+        if row is None:
+            return
+        menu = Gio.Menu()
+        for label, action in (("Open", "win.open-location"), ("Rescan", "win.rescan-location")):
+            item = Gio.MenuItem.new(label, None)
+            item.set_action_and_target_value(action, GLib.Variant("s", row.path))
+            menu.append_item(item)
+        self.side_menu.set_menu_model(menu)
+        self.side_menu.set_pointing_to(Gdk.Rectangle(x=int(x), y=int(y), width=1, height=1))
+        self.side_menu.popup()
+
     # ---- scanning ----
 
-    def start_scan(self, path):
+    def start_scan(self, path, location=None):
         self.cancel.set()  # stop any scan already running
         cancel = self.cancel = threading.Event()
         token = self.scan_token = object()
-        self.busy = True
+        serial = self.nav_serial
+        self.scanning = True
         self.progress.set_visible(True)
         self.progress.set_text(f"Scanning {path}…")
         self.cancel_btn.set_visible(True)
@@ -481,7 +627,7 @@ class Window(Gtk.ApplicationWindow):
                 err = None
             except OSError as e:
                 root, errors, err = None, 0, e.strerror or str(e)
-            GLib.idle_add(self.on_scan_done, token, path, root, errors, err)
+            GLib.idle_add(self.on_scan_done, token, serial, path, location, root, errors, err)
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -490,23 +636,42 @@ class Window(Gtk.ApplicationWindow):
             self.progress.set_text(f"{nfiles:,} files in {ndirs:,} folders — {p}")
         return False
 
-    def on_scan_done(self, token, path, root, errors, err):
+    def on_scan_done(self, token, serial, path, location, root, errors, err):
         if token is not self.scan_token:
             return False
         self.scan_token = None
-        self.busy = False
+        self.scanning = False
         self.progress.set_visible(False)
         self.cancel_btn.set_visible(False)
         if root is None:
             self.status.set_text(f"Could not scan {path}: {err}" if err else "Scan cancelled.")
             self.update_selection()
             return False
-        self.root = root
-        self.scan_errors = errors
-        self.history = []
-        self.current = None
-        self.navigate(root)
+        cur_path = node_path(self.current) if self.current is not None else None
+        self.graft(root, errors)
+        self.update_sidebar()
+        if serial == self.nav_serial:  # user stayed put while it scanned: go to the result
+            self.show(root, location)
+        else:  # user browsed elsewhere meanwhile: stay there
+            self.relocate(cur_path)
+            self.status.set_text(f"Finished scanning {path}.")
         return False
+
+    def relocate(self, cur_path):
+        """Re-find the current folder after its tree changed under it."""
+        if self.current is not None and self.attached(self.current):
+            self.history = [n for n in self.history if self.attached(n)]
+            self.populate()
+            return
+        node = self.lookup(cur_path) if cur_path else None
+        while node is None and cur_path and cur_path != "/":
+            cur_path = os.path.dirname(cur_path)
+            node = self.lookup(cur_path)
+        self.root = self.current = None
+        if node is not None:
+            self.show(node, self.location)
+        else:
+            self.populate()
 
     # ---- navigation ----
 
@@ -517,8 +682,11 @@ class Window(Gtk.ApplicationWindow):
         self.populate()
 
     def go_back(self):
-        if self.history:
-            self.navigate(self.history.pop(), remember=False)
+        while self.history:
+            node = self.history.pop()
+            if self.attached(node):
+                self.navigate(node, remember=False)
+                return
 
     def go_up(self):
         if self.current is not None and self.current.parent is not None:
@@ -529,7 +697,7 @@ class Window(Gtk.ApplicationWindow):
         if e.node is not None and not e.node.flags & (MOUNTPOINT | UNREADABLE):
             self.navigate(e.node)
         elif e.node is not None and e.node.flags & MOUNTPOINT:
-            self.start_scan(e.path)
+            self.open_location(e.path)
         else:
             self.open_selected()
 
@@ -603,8 +771,9 @@ class Window(Gtk.ApplicationWindow):
             text = f"Largest {self.store.get_n_items()} files below this folder · " + text
         if sel:
             text = f"{len(sel)} selected ({fmt_size(sum(e.size for e in sel))}) · " + text
-        if getattr(self, "scan_errors", 0):
-            text += f" · {self.scan_errors:,} unreadable entries"
+        unreadable = self.cache.get(self.root.name, (None, 0))[1] if self.root is not None else 0
+        if unreadable:
+            text += f" · {unreadable:,} folders could not be read"
         self.status.set_text(text)
 
     def on_right_click(self, gesture, _n, x, y, wrap):
@@ -689,11 +858,13 @@ class Window(Gtk.ApplicationWindow):
         dlg.choose(self, None, done)
 
     def do_remove(self, entries, permanent):
-        self.busy = True
+        self.removing = True
         self.update_selection()
         self.progress.set_visible(True)
         self.progress.set_fraction(0)
-        root = self.root
+        trash = os.path.join(GLib.get_user_data_dir(), "Trash")
+        # trashed items land in the Trash, so a scanned Trash must be re-measured
+        refresh_trash = not permanent and self.lookup(trash) is not None
 
         def work():
             results = []
@@ -722,19 +893,26 @@ class Window(Gtk.ApplicationWindow):
                     except OSError:
                         pass
                 results.append((e, gone, rescanned, errs))
-            GLib.idle_add(self.on_removed, root, results, permanent)
+            new_trash = None
+            if refresh_trash:
+                try:
+                    new_trash = scan(trash)
+                except OSError:
+                    pass
+            GLib.idle_add(self.on_removed, results, permanent, new_trash)
 
         threading.Thread(target=work, daemon=True).start()
 
-    def on_removed(self, root, results, permanent):
-        self.busy = False
+    def on_removed(self, results, permanent, new_trash):
+        self.removing = False
         self.progress.set_visible(False)
+        cur_path = node_path(self.current) if self.current is not None else None
         freed = 0
         errors = []
         for e, gone, rescanned, errs in results:
             errors.extend(errs)
-            if root is not self.root:
-                continue  # tree was replaced by a rescan meanwhile
+            if not self.attached(e.parent_dir) or (e.node is not None and e.node.parent is not e.parent_dir):
+                continue  # that part of the tree was rescanned meanwhile
             if gone:
                 freed += e.size
                 if e.node is not None:
@@ -744,7 +922,10 @@ class Window(Gtk.ApplicationWindow):
             elif rescanned is not None:
                 freed += e.node.size - rescanned.size
                 replace_dir(e.node, rescanned)
-        self.populate()
+        if new_trash is not None and self.lookup(new_trash[0].name) is not None:
+            self.graft(*new_trash)
+        self.update_sidebar()
+        self.relocate(cur_path)
         done = sum(1 for r in results if r[1])
         msg = (f"Deleted {done} item(s), freed {fmt_size(freed)}." if permanent
                else f"Moved {done} item(s) ({fmt_size(freed)}) to the Trash.")

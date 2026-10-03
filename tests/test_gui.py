@@ -49,6 +49,26 @@ def s_scanned(w):
     w.on_activate(None, 0)
     check(w.current.name == "big", "double-click enters folder")
     w.go_up()
+    root = w.root
+    w.open_location(tmp)
+    check(not w.scanning and w.current is root, "re-opening a scanned location does not rescan")
+    w.open_location(f"{tmp}/big")
+    check(not w.scanning and w.current.name == "big" and w.root is root,
+          "opening a folder inside a scanned tree reuses the scan")
+    w.navigate(w.current.dirs[0])
+    w.open_location(tmp)
+    w.open_location(f"{tmp}/big")
+    check(w.current.name == "inner", "location resumes at the folder you left it on")
+    with open(f"{tmp}/big/new.bin", "wb") as f:
+        f.write(os.urandom(200_000))
+    w.open_location(f"{tmp}/big", rescan=True)
+    check(w.scanning, "explicit Rescan does scan")
+
+
+def s_rescanned(w):
+    check(len(w.cache) == 1 and w.root.size == du(), f"subfolder rescan merged into the tree ({w.root.size} vs {du()})")
+    check(w.current.name == "big" and "new.bin" in labels(w), f"rescan shows new files: {labels(w)}")
+    w.open_location(tmp)
     w.largest_btn.set_active(True)
     check(labels(w)[0] == os.path.join("big", "inner", "huge.bin"), f"largest-files view: {labels(w)[:2]}")
     w.do_remove([select(w, os.path.join("big", "inner", "huge.bin"))], True)
@@ -80,7 +100,7 @@ def s_trashed(w):
     w.close()
 
 
-steps = [s_scanned, s_deleted, s_dir_deleted, s_trashed]
+steps = [s_scanned, s_rescanned, s_deleted, s_dir_deleted, s_trashed]
 
 
 def run_next():
