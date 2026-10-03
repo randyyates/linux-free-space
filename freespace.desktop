@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Free Space
+Comment=Find what is using your disk space and remove it
+Exec=freespace %f
+Icon=drive-harddisk
+Terminal=false
+Categories=System;Utility;Filesystem;
