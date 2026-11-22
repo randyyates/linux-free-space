@@ -1,5 +1,5 @@
 """Scanner/tree tests: totals must match `du -sx -B1`, and stay consistent after removals."""
-import os, subprocess, sys, tempfile, unittest
+import os, subprocess, sys, tempfile, time, unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import freespace as fs
 
@@ -72,6 +72,65 @@ class ModelTest(unittest.TestCase):
             self.assertEqual(errors, 1)
         finally:
             os.chmod(f"{self.tmp}/locked", 0o755)
+
+    def tree_scan(self, path):
+        job = fs.TreeScan(path)
+        while not job.apply(1):
+            time.sleep(0.01)
+        return job
+
+    def test_parallel_scan_matches_sequential(self):
+        os.makedirs(f"{self.tmp}/locked/inner")
+        os.chmod(f"{self.tmp}/locked", 0)
+        for i in range(30):  # enough folders to be split across workers
+            os.makedirs(f"{self.tmp}/many/{i}/deep")
+            with open(f"{self.tmp}/many/{i}/deep/f", "wb") as f:
+                f.write(os.urandom(5000 + i))
+        try:
+            fs.CHUNK, old = 3, fs.CHUNK
+            job = self.tree_scan(self.tmp)
+            fs.CHUNK = old
+            seq, errors = fs.scan(self.tmp)
+            self.assertEqual(job.root.size, seq.size)
+            self.assertEqual(job.root.count, seq.count)
+            self.assertEqual(job.errors, errors)
+            self.assertEqual(job.root.pending, 0)
+            walk_check(job.root)
+        finally:
+            os.chmod(f"{self.tmp}/locked", 0o755)
+        self.assertEqual(job.root.size, du(self.tmp))
+
+    def test_parallel_scan_partial_tree_is_consistent(self):
+        job = fs.TreeScan(self.tmp)
+        fs.CHUNK, old = 2, fs.CHUNK
+        try:
+            while not job.apply(0):  # one batch at a time; totals add up at every step
+                walk_check(job.root)
+                self.assertEqual(job.root.pending, len(job.waiting))
+                time.sleep(0.005)
+        finally:
+            fs.CHUNK = old
+        walk_check(job.root)
+        self.assertEqual(job.root.size, du(self.tmp))
+
+    def test_quick_refresh(self):
+        old, _ = fs.scan(self.tmp)
+        time.sleep(0.01)
+        with open(f"{self.tmp}/a/b/c/new.bin", "wb") as f:  # added deep down
+            f.write(os.urandom(400_000))
+        subprocess.run(["rm", "-rf", f"{self.tmp}/d"])
+        stats = {}
+        new, errors = fs.scan(self.tmp, prev=old, stats=stats)
+        self.assertEqual(new.size, du(self.tmp))
+        walk_check(new)
+        self.assertEqual(stats["reread"], 2)  # the top (d removed) and a/b/c (file added)
+        # documented limit: a file growing in place in an unchanged folder is not seen
+        with open(f"{self.tmp}/a/x.bin", "ab") as f:
+            f.write(os.urandom(100_000))
+        os.utime(f"{self.tmp}/a", (old.mtime, [d for d in old.dirs if d.name == "a"][0].mtime))
+        again, _ = fs.scan(self.tmp, prev=new)
+        self.assertEqual(again.size, new.size)
+        self.assertEqual(fs.scan(self.tmp)[0].size, du(self.tmp))
 
     def test_cancel(self):
         import threading

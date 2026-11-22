@@ -4,12 +4,15 @@
 Usage: freespace.py [PATH]      (defaults to your home directory)
 """
 import heapq
+import multiprocessing
 import os
+import queue
 import shutil
 import stat
 import sys
 import threading
 import time
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 
 import gi
 
@@ -31,7 +34,7 @@ class Dir:
     """One scanned directory. Files are stored as (name, bytes, mtime) tuples
     to keep memory low on trees with millions of files."""
 
-    __slots__ = ("name", "parent", "size", "count", "mtime", "dirs", "files", "flags")
+    __slots__ = ("name", "parent", "size", "count", "mtime", "dirs", "files", "flags", "pending")
 
     def __init__(self, name, parent, size=0, mtime=0.0):
         self.name = name  # the root holds its absolute path here
@@ -42,6 +45,7 @@ class Dir:
         self.dirs = []
         self.files = []
         self.flags = 0
+        self.pending = 0  # folders below (or this one) still being listed by a scan
 
 
 def node_path(node):
@@ -52,8 +56,13 @@ def node_path(node):
     return os.path.join(*reversed(parts))
 
 
-def scan(path, cancel=None, progress=None):
-    """Walk `path` without following symlinks or crossing filesystems.
+def scan(path, cancel=None, progress=None, prev=None, stats=None):
+    """Walk `path` in this process, without following symlinks or crossing filesystems.
+
+    With `prev` (an earlier scan of the same folder) this is a quick refresh: a folder whose
+    modification time has not changed had nothing added, removed or renamed in it, so its
+    earlier file list is kept and only its subfolders are checked. A file that grew in place
+    inside such a folder is missed. `stats["reread"]` receives how many folders were listed.
     Returns (root Dir, number of unreadable folders), or (None, n) if cancelled."""
     path = os.path.abspath(path)
     st = os.lstat(path)
@@ -61,15 +70,42 @@ def scan(path, cancel=None, progress=None):
     dev = st.st_dev
     seen_links = set()
     order = []  # pre-order; reversed, every child comes before its parent
-    stack = [(root, path)]
-    errors = nfiles = 0
+    stack = [(root, path, prev)]
+    errors = nfiles = reread = 0
     last = time.monotonic()
 
     while stack:
         if cancel is not None and cancel.is_set():
             return None, errors
-        node, p = stack.pop()
+        node, p, old = stack.pop()
         order.append(node)
+        if progress is not None:
+            now = time.monotonic()
+            if now - last > 0.1:
+                last = now
+                progress(nfiles, len(order), p)
+        if old is not None and old.mtime == node.mtime and not old.flags & UNREADABLE:
+            node.files = old.files  # tuples are immutable; the old tree is discarded
+            node.size += sum(f[1] for f in old.files)
+            node.count += len(old.files)
+            nfiles += len(old.files)
+            for d in old.dirs:
+                cp = os.path.join(p, d.name)
+                try:
+                    cst = os.lstat(cp)
+                except OSError:  # vanished just now
+                    continue
+                node.count += 1
+                child = Dir(d.name, node, cst.st_blocks * 512, cst.st_mtime)
+                node.dirs.append(child)
+                if cst.st_dev != dev:
+                    child.flags |= MOUNTPOINT
+                    child.size = 0
+                else:
+                    stack.append((child, cp, None if d.flags & MOUNTPOINT else d))
+            continue
+        reread += 1
+        olddirs = {d.name: d for d in old.dirs if not d.flags & MOUNTPOINT} if old is not None else {}
         try:
             it = os.scandir(p)
         except OSError:
@@ -90,7 +126,7 @@ def scan(path, cancel=None, progress=None):
                         child.flags |= MOUNTPOINT
                         child.size = 0
                     else:
-                        stack.append((child, e.path))
+                        stack.append((child, e.path, olddirs.get(e.name)))
                 else:
                     size = st.st_blocks * 512
                     if st.st_nlink > 1:  # count hard-linked data once
@@ -102,29 +138,168 @@ def scan(path, cancel=None, progress=None):
                     node.files.append((e.name, size, st.st_mtime))
                     node.size += size
                     nfiles += 1
-        if progress is not None:
-            now = time.monotonic()
-            if now - last > 0.1:
-                last = now
-                progress(nfiles, len(order), p)
 
     for node in reversed(order):
         if node.parent is not None:
             node.parent.size += node.size
             node.parent.count += node.count
+    if stats is not None:
+        stats["reread"] = reread
     return root, errors
 
 
-def propagate(node, dsize, dcount):
+# ------------------------------------------------------- parallel scan ----
+
+WORKERS = min(8, os.cpu_count() or 1)
+CHUNK = 400  # folders a worker lists before handing the rest of its stack back
+_pool = None
+
+
+def pool():
+    global _pool
+    if _pool is None:
+        _pool = ProcessPoolExecutor(WORKERS, mp_context=multiprocessing.get_context("forkserver"))
+    return _pool
+
+
+def walk_chunk(paths, dev, budget):
+    """Worker-process half of TreeScan: list up to `budget` folders depth-first from `paths`.
+    Returns (records, folders still to list). A record is (path, files, subdirs, hardlinks):
+    files are (name, bytes, mtime), or None if the folder could not be read; subdirs are
+    (name, bytes, mtime, on_other_fs); hardlinks are (index in files, inode)."""
+    stack, recs = list(paths), []
+    while stack and len(recs) < budget:
+        p = stack.pop()
+        try:
+            it = os.scandir(p)
+        except OSError:
+            recs.append((p, None, (), ()))
+            continue
+        files, dirs, links = [], [], []
+        with it:
+            for e in it:
+                try:
+                    st = e.stat(follow_symlinks=False)
+                except OSError:  # vanished mid-scan
+                    continue
+                if stat.S_ISDIR(st.st_mode):
+                    other = st.st_dev != dev
+                    dirs.append((e.name, st.st_blocks * 512, st.st_mtime, other))
+                    if not other:
+                        stack.append(e.path)
+                else:
+                    if st.st_nlink > 1:
+                        links.append((len(files), st.st_ino))
+                    files.append((e.name, st.st_blocks * 512, st.st_mtime))
+        recs.append((p, files, dirs, links))
+    return recs, stack
+
+
+class TreeScan:
+    """Scan `path` across the worker pool. Worker results queue up in a background thread;
+    apply(), called on the GTK thread, grows the tree from them. While it grows, every
+    folder's size, count and `pending` (folders below it not yet listed) stay consistent,
+    so the tree can be shown and browsed as it fills in."""
+
+    def __init__(self, path):
+        path = os.path.abspath(path)
+        st = os.lstat(path)  # OSError if it is not there
+        self.root = Dir(path, None, st.st_blocks * 512, st.st_mtime)
+        self.root.pending = 1
+        self.dev = st.st_dev
+        self.waiting = {path: self.root}  # listed by a worker soon; keyed by absolute path
+        self.seen_links = set()
+        self.errors = self.nfiles = self.ndirs = 0
+        self.last_path = path
+        self.touched = set()  # folders whose contents arrived since the caller last cleared it
+        self.done = False
+        self.cancel = threading.Event()
+        self.queue = queue.SimpleQueue()
+        threading.Thread(target=self._dispatch, daemon=True).start()
+
+    def _dispatch(self):
+        try:
+            ex = pool()
+            pend = {ex.submit(walk_chunk, [self.root.name], self.dev, 1)}  # top level first
+            while pend and not self.cancel.is_set():
+                done, pend = wait(pend, timeout=0.2, return_when=FIRST_COMPLETED)
+                for f in done:
+                    recs, rest = f.result()
+                    self.queue.put(recs)
+                    n = min(len(rest), max(2, 2 * WORKERS - len(pend)))
+                    for i in range(n):
+                        pend.add(ex.submit(walk_chunk, rest[i::n], self.dev, CHUNK))
+        except Exception as e:  # e.g. a worker process died
+            global _pool
+            _pool = None
+            self.queue.put(e)
+        self.queue.put(None)
+
+    def apply(self, budget=0.02):
+        """Add the records received so far, for up to `budget` seconds.
+        Returns True once the whole tree is in. Raises if the scan failed."""
+        end = time.monotonic() + budget
+        first = True  # always take at least one batch
+        while not self.done and (first or time.monotonic() < end):
+            first = False
+            try:
+                item = self.queue.get_nowait()
+            except queue.Empty:
+                break
+            if item is None:
+                self.done = True
+            elif isinstance(item, BaseException):
+                raise item
+            else:
+                for rec in item:
+                    self._add(*rec)
+        return self.done
+
+    def _add(self, p, files, dirs, links):
+        node = self.waiting.pop(p)
+        self.ndirs += 1
+        self.last_path = p
+        if files is None:
+            node.flags |= UNREADABLE
+            self.errors += 1
+            propagate(node, 0, 0, -1)
+            return
+        for i, ino in links:  # count hard-linked data once
+            key = (self.dev, ino)
+            if key in self.seen_links:
+                name, _, mtime = files[i]
+                files[i] = (name, 0, mtime)
+            else:
+                self.seen_links.add(key)
+        node.files = files
+        self.nfiles += len(files)
+        size = sum(f[1] for f in files)
+        npending = 0
+        for name, dsize, mtime, other in dirs:
+            child = Dir(name, node, 0 if other else dsize, mtime)
+            if other:
+                child.flags |= MOUNTPOINT
+            else:
+                child.pending = 1
+                self.waiting[os.path.join(p, name)] = child
+                npending += 1
+            node.dirs.append(child)
+            size += child.size
+        propagate(node, size, len(files) + len(dirs), npending - 1)
+        self.touched.add(node)
+
+
+def propagate(node, dsize, dcount, dpending=0):
     while node is not None:
         node.size += dsize
         node.count += dcount
+        node.pending += dpending
         node = node.parent
 
 
 def detach_dir(node):
     node.parent.dirs.remove(node)
-    propagate(node.parent, -node.size, -(node.count + 1))
+    propagate(node.parent, -node.size, -(node.count + 1), -node.pending)
     node.parent = None  # marks it detached (see tree_root)
 
 
@@ -139,7 +314,7 @@ def replace_dir(old, new):
     parent.dirs[parent.dirs.index(old)] = new
     new.name, new.parent = old.name, parent
     old.parent = None
-    propagate(parent, new.size - old.size, new.count - old.count)
+    propagate(parent, new.size - old.size, new.count - old.count, new.pending - old.pending)
 
 
 def tree_root(node):
@@ -223,6 +398,10 @@ class Entry(GObject.Object):
             self.count = None
         self.label = label or self.fname
 
+    def refresh(self):
+        if self.node is not None:
+            self.size, self.mtime, self.count = self.node.size, self.node.mtime, self.node.count
+
     @property
     def path(self):
         return os.path.join(node_path(self.parent_dir), self.fname)
@@ -251,10 +430,12 @@ class Window(Gtk.ApplicationWindow):
         self.root = None
         self.current = None
         self.history = []
-        self.cancel = threading.Event()
+        self.cancel = threading.Event()  # stops a quick refresh
         self.scan_token = None
+        self.job = None  # TreeScan in progress
         self.scanning = self.removing = False
-        self.nav_serial = 0
+        self.bound = set()  # list cells currently showing an entry, refreshed while a scan runs
+        self.last_refresh = 0.0
         self.cache = {}  # top path -> (root Dir, unreadable count); trees never overlap
         self.location = None  # sidebar location being browsed
         self.resume = {}  # location -> last folder viewed there
@@ -264,9 +445,14 @@ class Window(Gtk.ApplicationWindow):
         open_btn = Gtk.Button(icon_name="folder-open-symbolic", tooltip_text="Scan a folder…")
         open_btn.connect("clicked", self.on_choose_folder)
         header.pack_start(open_btn)
-        self.rescan_btn = Gtk.Button(icon_name="view-refresh-symbolic", tooltip_text="Rescan this folder")
+        self.rescan_btn = Gtk.Button(icon_name="view-refresh-symbolic", tooltip_text="Rescan this folder (F5)")
         self.rescan_btn.connect("clicked", lambda *_: self.rescan_current())
         header.pack_start(self.rescan_btn)
+        self.quick_btn = Gtk.Button(label="Quick refresh", tooltip_text=(
+            "Re-read only the folders whose contents changed since the last scan (Ctrl+R).\n"
+            "Fast, but misses files that grew or shrank in place: use Rescan for exact sizes."))
+        self.quick_btn.connect("clicked", lambda *_: self.quick_refresh())
+        header.pack_start(self.quick_btn)
 
         paned = Gtk.Paned(position=250, shrink_start_child=False)
         self.set_child(paned)
@@ -313,7 +499,7 @@ class Window(Gtk.ApplicationWindow):
         self.status.add_css_class("numeric")
         bar.pack_start(self.status)
         self.cancel_btn = Gtk.Button(label="Cancel scan", visible=False)
-        self.cancel_btn.connect("clicked", lambda *_: self.cancel.set())
+        self.cancel_btn.connect("clicked", lambda *_: self.cancel_scan())
         bar.pack_end(self.cancel_btn)
         self.delete_btn = Gtk.Button(label="Delete Permanently", tooltip_text="Shift+Delete")
         self.delete_btn.add_css_class("destructive-action")
@@ -407,8 +593,11 @@ class Window(Gtk.ApplicationWindow):
             def on_bind(_f, li):
                 w = li.get_child()
                 w.entry = li.get_item()
-                bind(w.get_first_child(), w.entry)
+                w.rebind = lambda: bind(w.get_first_child(), w.entry)
+                w.rebind()
+                self.bound.add(w)
             f.connect("bind", on_bind)
+            f.connect("unbind", lambda _f, li: self.bound.discard(li.get_child()))
             c = Gtk.ColumnViewColumn(title=title, factory=f, expand=expand, resizable=True)
             if width:
                 c.set_fixed_width(width)
@@ -461,8 +650,10 @@ class Window(Gtk.ApplicationWindow):
 
         name_col = col("Name", name_setup, name_bind, lambda e: e.label.casefold(), expand=True)
         col("Share of folder", usage_setup, usage_bind, lambda e: e.size, width=190)
-        size_col = col("Size", label_setup, lambda l, e: l.set_text(fmt_size(e.size)), lambda e: e.size, width=100)
-        col("Items", label_setup, lambda l, e: l.set_text("" if e.count is None else f"{e.count:,}"),
+        more = lambda e: "…" if e.node is not None and e.node.pending else ""  # still being scanned
+        size_col = col("Size", label_setup, lambda l, e: l.set_text(fmt_size(e.size) + more(e)),
+                       lambda e: e.size, width=100)
+        col("Items", label_setup, lambda l, e: l.set_text("" if e.count is None else f"{e.count:,}{more(e)}"),
             lambda e: -1 if e.count is None else e.count, width=90)
         col("Modified", label_setup, lambda l, e: l.set_text(time.strftime("%Y-%m-%d", time.localtime(e.mtime))),
             lambda e: e.mtime, width=110)
@@ -481,7 +672,8 @@ class Window(Gtk.ApplicationWindow):
         self.menu.set_has_arrow(False)
         self.menu.set_halign(Gtk.Align.START)
         self.menu.set_parent(self.view)
-        self.connect("close-request", lambda *_: self.menu.unparent() or self.side_menu.unparent() or False)
+        self.connect("close-request", lambda *_: self.stop_scan() or self.menu.unparent()
+                     or self.side_menu.unparent() or False)
 
     def cell(self, child):
         """Wrap a cell's content so a right-click selects the row and opens the menu."""
@@ -533,19 +725,37 @@ class Window(Gtk.ApplicationWindow):
         entry = self.cache.get(root.name)
         return entry is not None and entry[0] is root
 
-    def graft(self, new, errors):
-        """Merge a fresh scan into the cache, replacing whatever it covers."""
+    def covers(self, new, top):
+        """Whether a scan of `new` takes in the cached tree rooted at `top`."""
+        base = new.name.rstrip("/") + "/"
+        if top != new.name and not top.startswith(base):
+            return False
+        try:  # a tree on another filesystem below `new` is not part of its scan
+            return os.lstat(top).st_dev == os.lstat(new.name).st_dev
+        except OSError:
+            return True
+
+    def recount(self, node):
+        root = tree_root(node)
+        if self.cache.get(root.name, (None,))[0] is root:
+            self.cache[root.name] = (root, count_unreadable(root))
+
+    def graft(self, new):
+        """Put a fresh scan in the cache, replacing whatever it covers. Returns an undo."""
         path = new.name
         old = self.lookup(path)
         if old is not None and old.parent is not None:  # a subfolder of a scanned tree
-            top = tree_root(old).name
-            root, n = self.cache[top]
-            self.cache[top] = (root, n - count_unreadable(old) + errors)
             replace_dir(old, new)
-            return
-        for top in [t for t in self.cache if find(new, t) is not None]:
-            del self.cache[top]  # the same folder, or a tree now inside this one
-        self.cache[path] = (new, errors)
+            self.recount(new)
+            return lambda: new.parent is not None and replace_dir(new, old)
+        removed = {t: self.cache.pop(t) for t in [t for t in self.cache if self.covers(new, t)]}
+        self.cache[path] = (new, count_unreadable(new))
+
+        def undo():
+            if self.cache.get(path, (None,))[0] is new:
+                del self.cache[path]
+            self.cache.update(removed)
+        return undo
 
     def open_location(self, path, rescan=False):
         """Show a location, scanning it only if it has not been scanned yet."""
@@ -566,7 +776,6 @@ class Window(Gtk.ApplicationWindow):
     def show(self, node, location):
         if self.current is not None and self.location is not None:
             self.resume[self.location] = self.current
-        self.nav_serial += 1
         self.location = location
         root = tree_root(node)
         if root is not self.root:
@@ -582,7 +791,9 @@ class Window(Gtk.ApplicationWindow):
     def update_sidebar(self):
         for row in self.side_rows:
             node = self.lookup(row.path)
-            row.state.set_text(f"Scanned · {fmt_size(node.size)}" if node is not None else "Not scanned yet")
+            row.state.set_text("Not scanned yet" if node is None else
+                               f"Scanning · {fmt_size(node.size)}…" if node.pending else
+                               f"Scanned · {fmt_size(node.size)}")
             if row.level is not None:
                 try:
                     du = shutil.disk_usage(row.path)
@@ -607,54 +818,126 @@ class Window(Gtk.ApplicationWindow):
     # ---- scanning ----
 
     def start_scan(self, path, location=None):
-        self.cancel.set()  # stop any scan already running
-        cancel = self.cancel = threading.Event()
-        token = self.scan_token = object()
-        serial = self.nav_serial
+        """Scan `path` in parallel and show it at once, filling in as results arrive."""
+        self.stop_scan()
+        try:
+            job = TreeScan(path)
+        except OSError as e:
+            self.status.set_text(f"Could not scan {path}: {e.strerror or e}")
+            return
+        job.undo = self.graft(job.root)
+        self.job = job
+        self.set_scanning(f"Scanning {job.root.name}…")
+        self.show(job.root, location)
+        GLib.timeout_add(40, self.on_scan_tick, job)
+
+    def set_scanning(self, text):
         self.scanning = True
         self.progress.set_visible(True)
-        self.progress.set_text(f"Scanning {path}…")
+        self.progress.set_text(text)
         self.cancel_btn.set_visible(True)
         self.update_selection()
-        self._pulse = GLib.timeout_add(120, lambda: self.progress.pulse() or self.scan_token is token)
+        token = self.scan_token = object()
+        GLib.timeout_add(120, lambda: self.progress.pulse() or self.scan_token is token)
 
-        def progress(nfiles, ndirs, p):
-            GLib.idle_add(self.on_scan_progress, token, nfiles, ndirs, p)
-
-        def work():
-            try:
-                root, errors = scan(path, cancel, progress)
-                err = None
-            except OSError as e:
-                root, errors, err = None, 0, e.strerror or str(e)
-            GLib.idle_add(self.on_scan_done, token, serial, path, location, root, errors, err)
-
-        threading.Thread(target=work, daemon=True).start()
-
-    def on_scan_progress(self, token, nfiles, ndirs, p):
-        if token is self.scan_token:
-            self.progress.set_text(f"{nfiles:,} files in {ndirs:,} folders — {p}")
-        return False
-
-    def on_scan_done(self, token, serial, path, location, root, errors, err):
-        if token is not self.scan_token:
-            return False
-        self.scan_token = None
+    def end_scanning(self):
+        self.scan_token = self.job = None
         self.scanning = False
         self.progress.set_visible(False)
         self.cancel_btn.set_visible(False)
-        if root is None:
-            self.status.set_text(f"Could not scan {path}: {err}" if err else "Scan cancelled.")
+
+    def stop_scan(self):
+        """Abandon a scan in progress, putting back what was there before it."""
+        self.cancel.set()
+        job = self.job
+        if job is None:
+            return
+        job.cancel.set()
+        cur_path = node_path(self.current) if self.current is not None else None
+        job.undo()
+        self.end_scanning()
+        self.update_sidebar()
+        self.relocate(cur_path)
+
+    def cancel_scan(self):
+        busy = self.scanning
+        self.stop_scan()
+        if busy:
+            self.end_scanning()
             self.update_selection()
+            self.status.set_text("Scan cancelled.")
+
+    def on_scan_tick(self, job):
+        if job is not self.job:
+            return False
+        try:
+            done = job.apply(0.025)
+        except Exception as e:
+            self.stop_scan()
+            self.status.set_text(f"Scan failed: {e}")
+            return False
+        if self.current in job.touched and not self.largest_btn.get_active():
+            self.populate()  # the folder on screen just got its listing
+        job.touched.clear()
+        now = time.monotonic()
+        if done or now - self.last_refresh > 0.4:
+            self.last_refresh = now
+            self.progress.set_text(f"{job.nfiles:,} files in {job.ndirs:,} folders — {job.last_path}")
+            self.refresh_view()
+            self.update_sidebar()
+        if done:
+            self.end_scanning()
+            self.recount(job.root)
+            if self.largest_btn.get_active():
+                self.populate()
+            self.update_selection()
+        return not done
+
+    def refresh_view(self):
+        """Show the current sizes of the listed entries without rebuilding the list."""
+        for i in range(self.store.get_n_items()):
+            self.store.get_item(i).refresh()
+        for w in list(self.bound):
+            w.rebind()
+        self.view.get_sorter().changed(Gtk.SorterChange.DIFFERENT)
+
+    def quick_refresh(self):
+        """Re-measure the current folder, re-reading only folders whose listing changed."""
+        if self.current is None or self.busy:
+            return
+        old, path, location = self.current, node_path(self.current), self.location
+        self.cancel = cancel = threading.Event()
+        self.set_scanning(f"Checking {path} for changes…")
+        token = self.scan_token
+
+        def progress(nfiles, ndirs, p):
+            GLib.idle_add(lambda: token is self.scan_token and self.progress.set_text(
+                f"Checked {ndirs:,} folders — {p}") and False)
+
+        def work():
+            stats = {}
+            try:
+                root, _ = scan(path, cancel, progress, prev=old, stats=stats)
+                err = None
+            except OSError as e:
+                root, err = None, e.strerror or str(e)
+            GLib.idle_add(self.on_quick_done, token, path, location, root, stats.get("reread", 0), err)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def on_quick_done(self, token, path, location, root, reread, err):
+        if token is not self.scan_token:
+            return False
+        self.end_scanning()
+        if root is None:
+            self.update_selection()
+            self.status.set_text(f"Could not refresh {path}: {err}" if err else "Refresh cancelled.")
             return False
         cur_path = node_path(self.current) if self.current is not None else None
-        self.graft(root, errors)
+        self.graft(root)
         self.update_sidebar()
-        if serial == self.nav_serial:  # user stayed put while it scanned: go to the result
-            self.show(root, location)
-        else:  # user browsed elsewhere meanwhile: stay there
-            self.relocate(cur_path)
-            self.status.set_text(f"Finished scanning {path}.")
+        self.relocate(cur_path)
+        self.status.set_text(f"Quick refresh of {path}: {reread:,} changed folder(s) re-read.")
         return False
 
     def relocate(self, cur_path):
@@ -799,6 +1082,10 @@ class Window(Gtk.ApplicationWindow):
             self.go_up()
         elif alt and keyval == Gdk.KEY_Left:
             self.go_back()
+        elif keyval == Gdk.KEY_F5:
+            self.rescan_current()
+        elif keyval == Gdk.KEY_r and state & Gdk.ModifierType.CONTROL_MASK:
+            self.quick_refresh()
         else:
             return False
         return True
@@ -923,7 +1210,7 @@ class Window(Gtk.ApplicationWindow):
                 freed += e.node.size - rescanned.size
                 replace_dir(e.node, rescanned)
         if new_trash is not None and self.lookup(new_trash[0].name) is not None:
-            self.graft(*new_trash)
+            self.graft(new_trash[0])
         self.update_sidebar()
         self.relocate(cur_path)
         done = sum(1 for r in results if r[1])
